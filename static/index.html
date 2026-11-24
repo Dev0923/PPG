@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MAX30102 + ESP32-S3 Real-Time PPG Acquisition</title>
+  <meta name="description" content="High-precision dual-channel photoplethysmogram (PPG) acquisition and monitoring workstation for MAX30102 and ESP32-S3.">
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2331e6d1'><path d='M3 12h4l2.2-7 4.2 14 2.2-7H21'/></svg>">
+</head>
+<body>
+
+  <main class="app-shell">
+    <!-- Topbar Navigation -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark">
+          <svg class="icon" width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="M3 12h4l2.2-7 4.2 14 2.2-7H21" />
+          </svg>
+        </div>
+        <div>
+          <div class="brand-title-row">
+            <div class="brand-title">MAX30102</div>
+            <span class="device-chip">ESP32-S3</span>
+          </div>
+          <p>PPG acquisition · Red + infrared</p>
+        </div>
+      </div>
+
+      <div class="header-actions">
+        <div class="port-select">
+          <span class="port-dot"></span>
+          <label for="portSelect" style="display:none;">Serial Port</label>
+          <select id="portSelect" aria-label="Serial port">
+            <option value="auto">Auto-Detect ESP32</option>
+            <option value="COM9">USB · COM9</option>
+          </select>
+          <svg class="icon chevron" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="m7 10 5 5 5-5" />
+          </svg>
+        </div>
+
+        <button id="refreshPortsBtn" class="icon-button" aria-label="Refresh ports" title="Refresh ports">
+          <svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="M20 7v5h-5" />
+            <path d="M4 17v-5h5" />
+            <path d="M18.5 9A7 7 0 0 0 6 6.5L4 9m2 6a7 7 0 0 0 12 2.5l2-2.5" />
+          </svg>
+        </button>
+
+        <button id="statusPill" class="status-pill">
+          <span class="status-light"></span>
+          <span id="statusText">Disconnected</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Workspace Section -->
+    <section class="workspace">
+      <div class="workspace-heading">
+        <div>
+          <h1>Signal acquisition</h1>
+          <p>Inspect both optical channels and adjust the signal view.</p>
+        </div>
+        <span class="session-label">100 Hz / 2 channels</span>
+      </div>
+
+      <!-- Control Panel -->
+      <div class="control-panel">
+        <div class="primary-controls">
+          <button id="measureBtn" class="measure-button">
+            <svg id="measureBtnIcon" class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <path d="M12 2v10" />
+              <path d="M18.4 5.6a9 9 0 1 1-12.8 0" />
+            </svg>
+            <span id="measureBtnText">Measure PPG</span>
+          </button>
+
+          <button id="recordBtn" class="secondary-button" disabled title="CSV recording requires active measurement">
+            <span class="record-dot"></span>
+            <span id="recordBtnText">Record CSV</span>
+          </button>
+
+          <div class="record-timer-group">
+            <span class="control-label">Duration</span>
+            <div class="segmented compact" id="recordTimerSegmented" role="radiogroup" aria-label="Recording duration timer">
+              <button class="timer-btn selected" data-sec="0" title="Continuous recording until stopped">Manual</button>
+              <button class="timer-btn" data-sec="180" title="Record for 3 minutes (180 sec)">3 min</button>
+              <button class="timer-btn" data-sec="300" title="Record for 5 minutes (300 sec)">5 min</button>
+              <button class="timer-btn" data-sec="480" title="Record for 8 minutes (480 sec)">8 min</button>
+              <button class="timer-btn" data-sec="600" title="Record for 10 minutes (600 sec)">10 min</button>
+            </div>
+          </div>
+
+          <button id="clearPlotBtn" class="secondary-button">
+            <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7" />
+              <path d="M10 11v6m4-6v6" />
+            </svg>
+            <span>Clear trace</span>
+          </button>
+        </div>
+
+        <div class="signal-controls">
+          <div class="control-group">
+            <span class="control-label">Signal view</span>
+            <div class="segmented">
+              <button id="viewAcBtn" class="selected" data-mode="ac">AC · Pulse</button>
+              <button id="viewRawBtn" data-mode="raw">DC · Raw</button>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <span class="control-label">Window</span>
+            <div class="segmented compact">
+              <button class="window-btn" data-sec="4">4s</button>
+              <button class="window-btn selected" data-sec="8">8s</button>
+              <button class="window-btn" data-sec="12">12s</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Metrics Grid -->
+      <section class="metrics-grid">
+        <!-- Heart Rate Card -->
+        <article class="metric-card">
+          <div class="metric-heading">
+            <span>Heart rate</span>
+            <span class="metric-icon pink">
+              <svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M20.8 5.8c-1.5-2.3-4.8-2.5-6.8-.5L12 7.2l-2-1.9c-2-2-5.3-1.8-6.8.5-1.3 2-.9 4.6.8 6.3l8 7.7 8-7.7c1.7-1.7 2.1-4.3.8-6.3Z" />
+              </svg>
+            </span>
+          </div>
+          <div class="metric-value">
+            <strong id="bpmValue">— —</strong>
+            <span>BPM</span>
+          </div>
+          <div class="card-footer">
+            <span>Estimated from PPG</span>
+            <span id="bpmStatus">No data</span>
+          </div>
+        </article>
+
+        <!-- Finger Contact Card -->
+        <article class="metric-card">
+          <div class="metric-heading">
+            <span>Finger contact</span>
+            <span class="metric-icon amber">
+              <svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path d="M8 11V5a2 2 0 0 1 4 0v5" />
+                <path d="M12 10V3a2 2 0 0 1 4 0v8" />
+                <path d="M16 10V6a2 2 0 0 1 4 0v8c0 5-3 8-8 8-3.5 0-5.7-1.8-7.1-4.1L3.3 15A2.1 2.1 0 0 1 7 13l1 1" />
+              </svg>
+            </span>
+          </div>
+          <div>
+            <span id="fingerBadge" class="contact-badge">
+              <span></span>
+              <span id="fingerBadgeText">Not measured</span>
+            </span>
+          </div>
+          <div class="card-footer">
+            <span>IR optical threshold</span>
+            <span>&gt; 20,000 ADC</span>
+          </div>
+        </article>
+
+        <!-- Sampling Rate Card -->
+        <article class="metric-card">
+          <div class="metric-heading">
+            <span>Sampling rate</span>
+            <span class="metric-icon blue">
+              <svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path d="M3 12h4l2.2-7 4.2 14 2.2-7H21" />
+              </svg>
+            </span>
+          </div>
+          <div class="metric-value mono">
+            <strong id="sampleRateVal">0.0</strong>
+            <span>Hz</span>
+          </div>
+          <div class="card-footer">
+            <span>Target 100.0 Hz</span>
+            <span id="sampleCountVal">0 samples</span>
+          </div>
+        </article>
+
+        <!-- Optical Levels Card -->
+        <article class="metric-card">
+          <div class="metric-heading">
+            <span>Optical levels</span>
+            <span class="metric-icon purple">
+              <svg class="icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path d="M12 3v12m0 0 4-4m-4 4-4-4" />
+                <path d="M4 17v3h16v-3" />
+              </svg>
+            </span>
+          </div>
+          <div class="optical-values">
+            <div>
+              <span class="ir-text">IR</span>
+              <strong id="rawIrVal">— —</strong>
+            </div>
+            <div>
+              <span class="red-text">RED</span>
+              <strong id="rawRedVal">— —</strong>
+            </div>
+          </div>
+          <div class="card-footer">
+            <span>18-bit · 262,143 max</span>
+            <span>Dual LED</span>
+          </div>
+        </article>
+      </section>
+
+      <!-- Scope Panel -->
+      <section class="scope-panel">
+        <div class="scope-header">
+          <div>
+            <div class="eyebrow">Signal monitor</div>
+            <div class="scope-title">Dual-channel waveform</div>
+          </div>
+          <div class="scope-meta">
+            <span>
+              <i class="trace-dot ir"></i> IR · 880 nm
+            </span>
+            <span>
+              <i class="trace-dot red"></i> Red · 660 nm
+            </span>
+            <span id="timeScaleLabel" class="time-label">8.0 sec window</span>
+          </div>
+        </div>
+
+        <div class="scope-wrap">
+          <canvas id="ppgCanvas" class="scope-canvas"></canvas>
+          <div class="scale-labels">
+            <span>+1.0</span>
+            <span>0.0</span>
+            <span>−1.0</span>
+          </div>
+          <div id="canvasOverlay" class="scope-empty">
+            <div class="empty-icon">
+              <svg class="icon" width="27" height="27" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <path d="M3 12h4l2.2-7 4.2 14 2.2-7H21" />
+              </svg>
+            </div>
+            <strong>Ready to acquire signal</strong>
+            <span>Choose Measure PPG to stream live dual-channel optical waveform.</span>
+          </div>
+          <div id="recordingIndicator" class="recording-flag" style="display: none;">
+            <div class="recording-flag-header">
+              <span class="record-pulse"></span>
+              <span id="recordingSessionLabel">RECORDING SESSION</span>
+              <span id="recordingCountdown" class="timer-countdown">00:00</span>
+            </div>
+            <div id="recordingProgressTrack" class="recording-progress-track">
+              <div id="recordingProgressFill" class="recording-progress-fill"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="scope-footer">
+          <span>
+            <i id="liveDot" class="live-dot"></i>
+            <span id="liveStatusText">No active stream</span>
+          </span>
+          <span id="modeDescription">Dynamic baseline removal enabled</span>
+        </div>
+      </section>
+
+      <!-- Page Footer -->
+      <footer class="page-footer">
+        <span>MAX30102 optical sensor · 400 kHz I²C · ESP32-S3</span>
+        <button id="openHelpBtn">
+          <svg class="icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 11v5m0-8v.1" />
+          </svg>
+          Hardware setup
+        </button>
+      </footer>
+    </section>
+
+    <!-- Hardware Checklist Modal -->
+    <div id="hardwareAlertModal" class="modal-backdrop">
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <button id="modalCloseBtn" class="modal-close" aria-label="Close">
+          <svg class="icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <path d="m6 6 12 12M18 6 6 18" />
+          </svg>
+        </button>
+        <div class="modal-icon">
+          <svg class="icon" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <circle cx="12" cy="12" r="9" />
+            <path d="M12 11v5m0-8v.1" />
+          </svg>
+        </div>
+        <div class="eyebrow">Hardware checklist</div>
+        <div class="modal-title" id="alertModalTitle">Check your sensor connection</div>
+        <p id="alertModalMessage">
+          Connect the MAX30102 to the ESP32-S3 using the pins below.
+          Verify the supply voltage supported by your sensor breakout board.
+        </p>
+        <div class="pin-grid">
+          <div><span>SDA</span><strong>GPIO 8</strong></div>
+          <div><span>SCL</span><strong>GPIO 9</strong></div>
+          <div><span>Power</span><strong>3.3V or 5V</strong></div>
+          <div><span>Ground</span><strong>Common GND</strong></div>
+          <div><span>USB serial</span><strong>115200 (COM9)</strong></div>
+          <div><span>Mode</span><strong>SpO2 (Red+IR)</strong></div>
+        </div>
+        <button id="modalDismissBtn" class="modal-action">Close checklist</button>
+      </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div id="toastContainer" class="toast-container"></div>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local symlink / junction duplicate
+PPG_Acquisition
+
+# Recorded sensor data
+recordings/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
