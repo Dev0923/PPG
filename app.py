@@ -8,9 +8,12 @@ import time
 import asyncio
 import threading
 import webbrowser
+from collections import deque
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Set
 
+import numpy as np
+from scipy.signal import butter, sosfiltfilt, find_peaks
 import serial
 import serial.tools.list_ports
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
@@ -18,6 +21,9 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
+# Bandpass filter for finger PPG heart rate band (0.65 - 3.5 Hz => 39 - 210 BPM)
+_PPG_BANDPASS_SOS = butter(3, [0.65, 3.5], btype="bandpass", fs=100.0, output="sos")
 
 # Base directory
 BASE_DIR = Path(__file__).resolve().parent
@@ -83,12 +89,13 @@ class PPGHardwareManager:
         self.record_start_time: float = 0.0
         self.record_timer: Optional[threading.Timer] = None
         
-        # BPM calculation buffer
-        self.ir_buffer: List[float] = []
-        self.ir_timestamps: List[float] = []
-        self.last_beat_time: float = 0
+        # BPM calculation buffer (uses ESP32 microsecond timestamps)
+        self.ir_buffer: deque[float] = deque(maxlen=1200)
+        self.ir_timestamps: deque[float] = deque(maxlen=1200)
         self.current_bpm: float = 0.0
-        self.recent_bpms: List[float] = []
+        self.recent_bpms: deque[float] = deque(maxlen=5)
+        self._last_bpm_eval_sample: int = 0
+        self._last_valid_bpm_ts: float = 0.0
 
     def register_client(self, q: asyncio.Queue):
         with self.lock:
@@ -250,7 +257,8 @@ class PPGHardwareManager:
                     "target_port": target_port,
                 }
                 
-            # Start background reading thread
+            # Reset BPM state and start background reading thread
+            self._reset_bpm_state()
             self.is_running = True
             self.sample_count = 0
             self.start_time = time.time()
@@ -267,6 +275,7 @@ class PPGHardwareManager:
         """Stop serial acquisition and close port."""
         with self.lock:
             self.is_running = False
+            self._reset_bpm_state()
             if self.record_timer:
                 try:
                     self.record_timer.cancel()
@@ -373,43 +382,96 @@ class PPGHardwareManager:
             
         return {"success": True, "message": f"Recording saved to {filename}", "filename": filename}
 
-    def _update_bpm(self, ir_val: float, now: float, finger: int):
-        """Simple, robust real-time heart rate detector."""
+    def _reset_bpm_state(self):
+        """Clear all buffered PPG samples and BPM history."""
+        self.current_bpm = 0.0
+        self.ir_buffer.clear()
+        self.ir_timestamps.clear()
+        self.recent_bpms.clear()
+        self._last_bpm_eval_sample = 0
+        self._last_valid_bpm_ts = 0.0
+
+    def _estimate_window_bpm(self) -> Optional[float]:
+        """Estimate heart rate (BPM) from the current IR sliding window, or None if unreliable."""
+        t_win = np.asarray(self.ir_timestamps, dtype=np.float64)
+        ir_win = np.asarray(self.ir_buffer, dtype=np.float64)
+        dur = t_win[-1] - t_win[0]
+        n_grid = int(round(dur * 100.0))
+        if n_grid < 250:
+            return None
+
+        # Resample onto uniform 100 Hz grid, invert (absorption peak = IR valley), and detrend
+        t_grid = np.linspace(t_win[0], t_win[-1], n_grid)
+        sig = -np.interp(t_grid, t_win, ir_win)
+        sig = sig - np.linspace(sig[0], sig[-1], n_grid)
+
+        filt = sosfiltfilt(_PPG_BANDPASS_SOS, sig)
+        trim = 30
+        core = filt[trim:-trim] if len(filt) > (2 * trim + 100) else filt
+
+        # Robust amplitude check via MAD to resist motion spikes while supporting weak pulses
+        med = np.median(core)
+        mad = float(np.median(np.abs(core - med)) * 1.4826)
+        if mad < 8.0:
+            return None
+
+        # Minimum peak distance 0.33s (181.8 BPM max) suppresses dicrotic notch double-counting
+        peaks, _ = find_peaks(core, distance=33, prominence=max(15.0, 0.8 * mad))
+        if len(peaks) < 4:
+            return None
+
+        ibis = np.diff(peaks) / 100.0
+        valid_ibis = ibis[(ibis >= 0.333) & (ibis <= 1.5)]
+        if len(valid_ibis) < 3:
+            return None
+
+        med_ibi = float(np.median(valid_ibis))
+        consistent_ibis = valid_ibis[np.abs(valid_ibis - med_ibi) <= 0.18 * med_ibi]
+        if len(consistent_ibis) < 3:
+            return None
+
+        window_bpm = 60.0 / float(np.median(consistent_ibis))
+        return window_bpm if 40.0 <= window_bpm <= 180.0 else None
+
+    def _update_bpm(self, ir_val: float, ts_us: int, finger: int):
+        """Bandpass-filtered systolic peak + outlier-rejected IBI heart rate detector."""
         if finger == 0 or ir_val < 15000:
-            self.current_bpm = 0.0
-            self.ir_buffer.clear()
-            self.ir_timestamps.clear()
+            self._reset_bpm_state()
             return
-            
-        self.ir_buffer.append(ir_val)
-        self.ir_timestamps.append(now)
-        
-        # Keep 4-second sliding window (~400 samples at 100Hz)
-        while len(self.ir_timestamps) > 0 and (now - self.ir_timestamps[0]) > 4.0:
-            self.ir_buffer.pop(0)
-            self.ir_timestamps.pop(0)
-            
-        if len(self.ir_buffer) < 150:
+
+        t_sec = ts_us / 1_000_000.0
+
+        # Reset window if ESP32 timer restarted / timestamp jumped backward
+        if self.ir_timestamps and t_sec <= self.ir_timestamps[-1]:
+            self._reset_bpm_state()
+
+        self.ir_buffer.append(float(ir_val))
+        self.ir_timestamps.append(t_sec)
+
+        # Keep an 8-second sliding window using accurate ESP32 hardware timestamps
+        while self.ir_timestamps and (t_sec - self.ir_timestamps[0]) > 8.0:
+            self.ir_buffer.popleft()
+            self.ir_timestamps.popleft()
+
+        if len(self.ir_buffer) < 350 or (t_sec - self.ir_timestamps[0]) < 4.0:
             return
-            
-        vals = [-x for x in self.ir_buffer]
-        mean_val = sum(vals) / len(vals)
-        norm_vals = [v - mean_val for v in vals]
-        
-        threshold = max(norm_vals) * 0.45
-        if threshold > 200:
-            curr_val = norm_vals[-1]
-            if curr_val > threshold and curr_val > norm_vals[-2] and (now - self.last_beat_time) > 0.4:
-                # Local peak found
-                if self.last_beat_time > 0:
-                    delta = now - self.last_beat_time
-                    instant_bpm = 60.0 / delta
-                    if 45.0 <= instant_bpm <= 180.0:
-                        self.recent_bpms.append(instant_bpm)
-                        if len(self.recent_bpms) > 5:
-                            self.recent_bpms.pop(0)
-                        self.current_bpm = round(sum(self.recent_bpms) / len(self.recent_bpms), 1)
-                self.last_beat_time = now
+
+        # Recompute every 25 samples (~4 Hz at 100 Hz) to keep CPU overhead minimal
+        if (self.sample_count - self._last_bpm_eval_sample) < 25:
+            return
+        self._last_bpm_eval_sample = self.sample_count
+
+        window_bpm = self._estimate_window_bpm()
+        if window_bpm is None:
+            if self._last_valid_bpm_ts and (t_sec - self._last_valid_bpm_ts) > 4.0:
+                self.current_bpm = 0.0
+                self.recent_bpms.clear()
+            return
+
+        self.recent_bpms.append(window_bpm)
+        self._last_valid_bpm_ts = t_sec
+        if len(self.recent_bpms) >= 2:
+            self.current_bpm = round(float(np.median(self.recent_bpms)), 1)
 
     def _reader_worker(self):
         """Worker thread that continuously polls serial data and broadcasts."""
@@ -445,8 +507,8 @@ class PPGHardwareManager:
                             samples_in_sec = 0
                             last_rate_time = now
                             
-                        # Update BPM calculation
-                        self._update_bpm(ir, now, finger)
+                        # Update BPM calculation using ESP32 microsecond timestamp
+                        self._update_bpm(ir, ts_us, finger)
                         
                         payload = {
                             "timestamp_us": ts_us,
